@@ -13,13 +13,13 @@ Incorrect offsets may cause system instability or damage. Use at your own risk.
 Only processors that are supported by the Ryzen SMU driver should work. ONLY RYZEN 5000 and 9000 are supported. I can only test on 5700x3d.
 ## Prerequisites
 
-    - Ryzen CPU
+- Ryzen CPU
 
-    - Python 3.8+ with PyQt6 installed
+- Python 3.8+ with PyQt6 installed
 
-    - polkit (pkexec)
+- polkit (pkexec)
 
-    - The ryzen_smu kernel driver
+- The ryzen_smu kernel driver
 
 ## Installation
 ## 1. Install the Ryzen SMU driver
