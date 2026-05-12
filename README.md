@@ -22,26 +22,24 @@ Only processors that are supported by the Ryzen SMU driver should work. ONLY RYZ
     - The ryzen_smu kernel driver
 
 ## Installation
-
-
-## Using an AUR helper (e.g., yay, paru)
-```bash
-yay -S linux-ryzen-undervolt-git
-```
-## Or manually
 ### 1. Install the Ryzen SMU driver
 ```bash
 https://github.com/amkillam/ryzen_smu#installation
 ```
 ### 2. Install and remove the tool
-#### 2.1 Install
+## Using an AUR helper (e.g., yay, paru)
+```bash
+yay -S linux-ryzen-undervolt-git
+```
+## Or manually
+#### Install
 ```bash
 git clone https://github.com/softwaresocialist/linux-ryzen-undervolt-ui.git
 cd linux-ryzen-undervolt-ui
 chmod +x install.sh
 sudo ./install.sh
 ```
-#### 2.2 Remove
+#### Remove
 ```bash
 cd linux-ryzen-undervolt-ui
 chmod +x uninstall.sh
