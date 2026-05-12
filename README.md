@@ -56,13 +56,13 @@ The tool also works from the command line. All commands require root privileges 
 #### Core Specification Syntax
 Many commands accept flexible core specifications
 
-    Single core: 0, 2, 5
+- Single core: 0, 2, 5
     
-    Comma-separated list: 0,2,4
+- Comma-separated list: 0,2,4
     
-    Range (inclusive): 0-7 (all cores from 0 to 7)
+- Range (inclusive): 0-7 (all cores from 0 to 7)
     
-    Combination: 0,2-5,7 (cores 0, 2, 3, 4, 5, and 7)
+- Combination: 0,2-5,7 (cores 0, 2, 3, 4, 5, and 7)
 
 ### Core Operations
 ##### List current offsets for all cores
