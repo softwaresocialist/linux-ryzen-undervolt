@@ -23,9 +23,7 @@ Only processors that are supported by the Ryzen SMU driver should work. ONLY RYZ
 
 ## Installation
 ## 1. Install the Ryzen SMU driver
-```bash
 https://github.com/amkillam/ryzen_smu#installation
-```
 ## 2. Install and remove the tool
 ### Using an AUR helper (e.g., yay, paru)
 ```bash
