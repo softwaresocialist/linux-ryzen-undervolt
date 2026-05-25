@@ -19,11 +19,12 @@ import json
 import shutil
 import re
 import logging
+import logging.handlers
 import tempfile
 import fcntl
 import atexit
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from enum import Enum
 
 # ----------------------------------------------------------------------------
@@ -32,6 +33,16 @@ from enum import Enum
 log_level = logging.DEBUG if os.environ.get("RUV_DEBUG") == "1" else logging.INFO
 logging.basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ruv")
+
+def setup_syslog_logging() -> None:
+    """Add a syslog handler when running as root for auditability."""
+    if os.geteuid() == 0:
+        handler = logging.handlers.SysLogHandler(address="/dev/log")
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter("ruv[%(process)d]: %(levelname)s %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.debug("Syslog audit logging enabled.")
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -54,6 +65,7 @@ try:
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal
     from PyQt6.QtGui import QIcon, QCursor
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     GUI_AVAILABLE = True
 except ImportError:
     GUI_AVAILABLE = False
@@ -140,6 +152,9 @@ def detect_generation_from_cpuinfo() -> Optional['RyzenSMU.Generation']:
         logger.debug("Failed to read /proc/cpuinfo: %s", e)
     return None
 
+# ----------------------------------------------------------------------------
+# Generation configuration schema (data‑driven)
+# ----------------------------------------------------------------------------
 class RyzenSMU:
     FS_PATH = Path("/sys/kernel/ryzen_smu_drv/")
     VER_PATH = FS_PATH / "version"
@@ -153,6 +168,7 @@ class RyzenSMU:
         RAPHAEL = "raphael"
         UNSUPPORTED = "unsupported"
 
+    # Mapping from driver codename integer to generation
     CODENAME_MAP = {
         25: Generation.VERMEER,
         12: Generation.VERMEER,
@@ -161,11 +177,6 @@ class RyzenSMU:
         23: Generation.GRANITE_RIDGE,
         17: Generation.RAPHAEL,
     }
-
-    V_GET_OFFSET    = 0x48
-    V_SET_OFFSET    = 0x35
-    V_RESET_ALL     = 0x36
-    GR_SET_OFFSET_BASE = 0x50
 
     SMU_TIMEOUT = float(os.environ.get("RUV_SMU_TIMEOUT", "5.0"))
     SMU_RETRY_ATTEMPTS = max(1, int(os.environ.get("RUV_SMU_RETRY_ATTEMPTS", "3")))
@@ -178,10 +189,12 @@ class RyzenSMU:
         if not self.driver_loaded():
             raise RuntimeError("Ryzen SMU driver not loaded. Load with: sudo modprobe ryzen_smu")
         self.generation = self._detect_generation()
+        self.config = GENERATION_CONFIGS.get(self.generation, GENERATION_CONFIGS[self.Generation.UNSUPPORTED])
         self.core_id_list = get_physical_apic_ids_sorted()
         self.core_count = len(self.core_id_list)
         self.co_cache: Dict[int, int] = {}
-        if self.generation in (self.Generation.GRANITE_RIDGE, self.Generation.RAPHAEL):
+        if not self.config.read_support and self.generation != self.Generation.UNSUPPORTED:
+            # Write‑only or unsupported gen that still uses cache
             self._load_co_cache()
         logger.debug("RyzenSMU initialized. Gen: %s, cores: %d", self.generation.value, self.core_count)
 
@@ -281,65 +294,22 @@ class RyzenSMU:
         )
 
     def get_core_offset(self, core_index: int) -> Optional[int]:
-        if core_index < 0 or core_index >= self.core_count:
-            raise ValueError(f"Core index {core_index} out of range (0-{self.core_count-1})")
-
-        if self.generation == self.Generation.VERMEER:
-            apic_id = self.core_id_list[core_index]
-            arg = ((apic_id & 8) << 5 | (apic_id & 7)) << 20
-            try:
-                result = self._smu_command_with_retry(self.V_GET_OFFSET, arg)
-            except RuntimeError:
-                return None
-            value = result[0]
-            if value > 2**31 - 1:
-                value -= 2**32
-            return value
-        elif self.generation in (self.Generation.GRANITE_RIDGE, self.Generation.RAPHAEL):
-            return self.co_cache.get(core_index, 0)
+        """Return current offset (mV) for a core, or None on error."""
+        return self.config.get_offset(self, core_index)
 
     def set_core_offset(self, core_index: int, offset: int) -> None:
+        """Set offset (mV) for a core. Raises on failure."""
         if not (self.MIN_OFFSET <= offset <= self.MAX_OFFSET):
             raise ValueError(f"Offset {offset} mV out of range [{self.MIN_OFFSET}, {self.MAX_OFFSET}]")
         if core_index < 0 or core_index >= self.core_count:
             raise ValueError(f"Core index {core_index} out of range (0-{self.core_count-1})")
-
-        if self.generation == self.Generation.VERMEER:
-            apic_id = self.core_id_list[core_index]
-            old_offset = self.get_core_offset(core_index)
-            arg = (((apic_id & 8) << 5 | (apic_id & 7)) << 20) | (offset & 0xFFFF)
-            try:
-                self._smu_command_with_retry(self.V_SET_OFFSET, arg)
-                logger.debug("Set core %d (APIC %d) → %d mV", core_index, apic_id, offset)
-            except Exception:
-                if old_offset is not None:
-                    try:
-                        rollback_arg = (((apic_id & 8) << 5 | (apic_id & 7)) << 20) | (old_offset & 0xFFFF)
-                        self._smu_command_with_retry(self.V_SET_OFFSET, rollback_arg)
-                        logger.warning("Rollback succeeded for core %d to %d mV", core_index, old_offset)
-                    except Exception as e:
-                        logger.error("Rollback failed for core %d: %s", core_index, e)
-                raise
-        elif self.generation in (self.Generation.GRANITE_RIDGE, self.Generation.RAPHAEL):
-            op = self.GR_SET_OFFSET_BASE + core_index
-            encoded = offset & 0xFFFFFFFF if offset >= 0 else ((offset + 2**32) & 0xFFFFFFFF)
-            try:
-                self._smu_command_with_retry(op, encoded)
-                self.co_cache[core_index] = offset
-                self._save_co_cache()
-                logger.debug("Set core %d → %d mV (cached)", core_index, offset)
-            except Exception as e:
-                logger.warning("SMU write failed for core %d: %s. Using cache-only mode.", core_index, e)
-                self.co_cache[core_index] = offset
-                self._save_co_cache()
+        self.config.set_offset(self, core_index, offset)
+        logger.info("Core %d set to %d mV", core_index, offset)
 
     def reset_all_offsets(self) -> None:
-        if self.generation == self.Generation.VERMEER:
-            self._smu_command_with_retry(self.V_RESET_ALL, 0)
-        elif self.generation in (self.Generation.GRANITE_RIDGE, self.Generation.RAPHAEL):
-            for i in range(self.core_count):
-                self.set_core_offset(i, 0)
-        logger.debug("Reset all offsets")
+        """Reset all core offsets to 0 mV."""
+        self.config.reset_all(self)
+        logger.info("All offsets reset to 0 mV")
 
     def _load_co_cache(self) -> None:
         if CO_CACHE_FILE.is_file():
@@ -378,6 +348,129 @@ class RyzenSMU:
         logger.warning("Could not determine CPU generation – treating as unsupported")
         return self.Generation.UNSUPPORTED
 
+# ----------------------------------------------------------------------------
+# Generation‑specific configuration functions
+# ----------------------------------------------------------------------------
+class GenerationConfig:
+    """Holds the behaviour for a specific CPU generation."""
+    def __init__(self, *,
+                 name: str,
+                 read_support: bool,
+                 get_offset_fn: Optional[Callable[['RyzenSMU', int], Optional[int]]],
+                 set_offset_fn: Callable[['RyzenSMU', int, int], None],
+                 reset_all_fn: Callable[['RyzenSMU'], None]):
+        self.name = name
+        self.read_support = read_support
+        self.get_offset = get_offset_fn
+        self.set_offset = set_offset_fn
+        self.reset_all = reset_all_fn
+
+# Helper functions for Vermeer (Ryzen 5000)
+def _vermeer_pack_arg(smu: RyzenSMU, core_index: int) -> int:
+    apic_id = smu.core_id_list[core_index]
+    return ((apic_id & 8) << 5 | (apic_id & 7)) << 20
+
+def _vermeer_get_offset(smu: RyzenSMU, core_index: int) -> Optional[int]:
+    arg = _vermeer_pack_arg(smu, core_index)
+    try:
+        result = smu._smu_command_with_retry(0x48, arg)       # V_GET_OFFSET
+    except RuntimeError:
+        return None
+    value = result[0]
+    if value > 2**31 - 1:
+        value -= 2**32
+    return value
+
+def _vermeer_set_offset(smu: RyzenSMU, core_index: int, offset: int) -> None:
+    apic_id = smu.core_id_list[core_index]
+    old_offset = _vermeer_get_offset(smu, core_index)  # will be None on error
+    arg = _vermeer_pack_arg(smu, core_index) | (offset & 0xFFFF)
+    try:
+        smu._smu_command_with_retry(0x35, arg)                # V_SET_OFFSET
+        logger.debug("Set core %d (APIC %d) → %d mV", core_index, apic_id, offset)
+    except Exception:
+        if old_offset is not None:
+            try:
+                rollback_arg = _vermeer_pack_arg(smu, core_index) | (old_offset & 0xFFFF)
+                smu._smu_command_with_retry(0x35, rollback_arg)
+                logger.warning("Rollback succeeded for core %d to %d mV", core_index, old_offset)
+            except Exception as e:
+                logger.error("Rollback failed for core %d: %s", core_index, e)
+        raise
+
+def _vermeer_reset_all(smu: RyzenSMU) -> None:
+    smu._smu_command_with_retry(0x36, 0)                     # V_RESET_ALL
+
+# Helper for write‑only gens that use cache (Granite Ridge / Raphael)
+def _writeonly_get_offset(smu: RyzenSMU, core_index: int) -> Optional[int]:
+    return smu.co_cache.get(core_index, 0)
+
+def _writeonly_set_offset(smu: RyzenSMU, core_index: int, offset: int) -> None:
+    op = 0x50 + core_index                                    # GR_SET_OFFSET_BASE
+    encoded = offset & 0xFFFFFFFF if offset >= 0 else ((offset + 2**32) & 0xFFFFFFFF)
+    try:
+        smu._smu_command_with_retry(op, encoded)
+        smu.co_cache[core_index] = offset
+        smu._save_co_cache()
+        logger.debug("Set core %d → %d mV (cached)", core_index, offset)
+    except Exception as e:
+        logger.warning("SMU write failed for core %d: %s. Using cache-only mode.", core_index, e)
+        smu.co_cache[core_index] = offset
+        smu._save_co_cache()
+
+def _writeonly_reset_all(smu: RyzenSMU) -> None:
+    for i in range(smu.core_count):
+        _writeonly_set_offset(smu, i, 0)
+
+# Raphael is explicitly unsupported – raise error on any write attempt.
+def _raphael_set_offset(smu: RyzenSMU, core_index: int, offset: int) -> None:
+    raise NotImplementedError("Raphael (Ryzen 7000) is not supported. SMU commands are unknown.")
+
+def _raphael_reset_all(smu: RyzenSMU) -> None:
+    raise NotImplementedError("Raphael (Ryzen 7000) is not supported.")
+
+# Fallback for completely unsupported hardware
+def _unsupported_set_offset(smu: RyzenSMU, core_index: int, offset: int) -> None:
+    raise NotImplementedError("Your CPU generation is not supported by this tool.")
+
+def _unsupported_reset_all(smu: RyzenSMU) -> None:
+    raise NotImplementedError("Your CPU generation is not supported by this tool.")
+
+# Dictionary of generation configurations – the settings schema
+GENERATION_CONFIGS = {
+    RyzenSMU.Generation.VERMEER: GenerationConfig(
+        name="Vermeer (Ryzen 5000)",
+        read_support=True,
+        get_offset_fn=_vermeer_get_offset,
+        set_offset_fn=_vermeer_set_offset,
+        reset_all_fn=_vermeer_reset_all,
+    ),
+    RyzenSMU.Generation.GRANITE_RIDGE: GenerationConfig(
+        name="Granite Ridge (Ryzen 9000)",
+        read_support=False,
+        get_offset_fn=_writeonly_get_offset,
+        set_offset_fn=_writeonly_set_offset,
+        reset_all_fn=_writeonly_reset_all,
+    ),
+    RyzenSMU.Generation.RAPHAEL: GenerationConfig(
+        name="Raphael (Ryzen 7000)",
+        read_support=False,
+        get_offset_fn=_writeonly_get_offset,       # cache only, no real read
+        set_offset_fn=_raphael_set_offset,
+        reset_all_fn=_raphael_reset_all,
+    ),
+    RyzenSMU.Generation.UNSUPPORTED: GenerationConfig(
+        name="Unsupported",
+        read_support=False,
+        get_offset_fn=lambda smu, idx: None,
+        set_offset_fn=_unsupported_set_offset,
+        reset_all_fn=_unsupported_reset_all,
+    ),
+}
+
+# ----------------------------------------------------------------------------
+# Core discovery / helpers
+# ----------------------------------------------------------------------------
 def get_physical_apic_ids_sorted() -> List[int]:
     cpu_path = Path("/sys/devices/system/cpu")
     core_apic = {}
@@ -554,7 +647,6 @@ def _set_cores(smu: RyzenSMU, cores: List[int], offset: int) -> None:
             print("Rollback successful.", file=sys.stderr)
         raise RuntimeError(f"Failed to set offset on core {idx} ({e})")
 
-    # Verify and report the actual applied offset
     for idx in success:
         real = smu.get_core_offset(idx)
         if real == offset:
@@ -562,6 +654,7 @@ def _set_cores(smu: RyzenSMU, cores: List[int], offset: int) -> None:
         else:
             print(f"Core {idx}: requested {offset} mV, actual {real} mV")
 
+# CLI handlers (unchanged except syslog added via logging)
 def cli_status(args: argparse.Namespace) -> None:
     smu = RyzenSMU()
     if getattr(args, 'json', False):
@@ -740,6 +833,7 @@ WantedBy=multi-user.target
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "enable", "ruv-boot.service"], check=True)
         print(f"Boot service enabled with profile '{name}'.")
+        logger.info("Boot service enabled with profile '%s'", name)
     except PermissionError:
         print("Permission denied. Run with sudo.", file=sys.stderr)
         sys.exit(1)
@@ -753,6 +847,7 @@ def cli_boot_disable(args: argparse.Namespace) -> None:
         Path("/etc/systemd/system/ruv-boot.service").unlink(missing_ok=True)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         print("Boot service disabled.")
+        logger.info("Boot service disabled")
     except PermissionError:
         print("Permission denied. Run with sudo.", file=sys.stderr)
         sys.exit(1)
@@ -783,6 +878,7 @@ def cli_boot_status(args: argparse.Namespace) -> None:
 
 def cli_mode(cli_args: List[str]) -> None:
     acquire_lock()
+    setup_syslog_logging()          # <-- audit logging for privileged operations
 
     parser = argparse.ArgumentParser(
         prog="ruv-gui",
@@ -871,6 +967,7 @@ For negative offsets with 'apply-list', use '--' before the offset:
             sys.exit(1)
         return path
 
+    # … (hidden commands used by GUI, unchanged) …
     if args.command == "read-profile":
         path = _resolve_profile_path(args.file)
         try:
@@ -1001,6 +1098,9 @@ For negative offsets with 'apply-list', use '--' before the offset:
     else:
         parser.print_help()
 
+# ----------------------------------------------------------------------------
+# GUI (only if PyQt6 available)
+# ----------------------------------------------------------------------------
 if GUI_AVAILABLE:
 
     class WorkerThread(QThread):
@@ -1036,6 +1136,9 @@ if GUI_AVAILABLE:
                     if self.item(idx).checkState() == Qt.CheckState.Checked]
 
     class MainWindow(QMainWindow):
+        # Signal for single‑instance activation
+        activate_window = pyqtSignal()
+
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Ryzen Undervolt Tool")
@@ -1068,6 +1171,14 @@ if GUI_AVAILABLE:
             self._setup_ui()
             self.refresh_profile_list()
             self.list_offsets()
+
+            # Connect signal to bring window to front
+            self.activate_window.connect(self._bring_to_front)
+
+        def _bring_to_front(self):
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
 
         def _set_window_icon(self) -> None:
             icon = QIcon.fromTheme("ruv-gui")
@@ -1390,15 +1501,50 @@ if __name__ == "__main__":
         if not GUI_AVAILABLE:
             print("PyQt6 is required for the GUI.", file=sys.stderr)
             sys.exit(1)
+
         QApplication.setApplicationName("Ryzen Undervolt Tool")
         QApplication.setApplicationDisplayName("Ryzen Undervolt Tool")
         QApplication.setDesktopFileName("ruv-gui")
         app = QApplication(sys.argv)
+
+        # Single‑instance enforcement for GUI
+        SERVER_NAME = "ruv-gui-instance"
+        socket = QLocalSocket()
+        socket.connectToServer(SERVER_NAME)
+        if socket.waitForConnected(500):
+            # Another instance is already running – tell it to activate
+            socket.write(b"raise")
+            socket.flush()
+            socket.waitForBytesWritten(1000)
+            socket.close()
+            sys.exit(0)
+
+        # No running instance – start server
+        QLocalServer.removeServer(SERVER_NAME)   # clean up stale socket files
+        server = QLocalServer()
+        if not server.listen(SERVER_NAME):
+            print("Failed to create single-instance lock.", file=sys.stderr)
+            sys.exit(1)
+
         app_icon = QIcon.fromTheme("ruv-gui")
         if app_icon.isNull() and os.path.exists(ICON_FALLBACK_PATH):
             app_icon = QIcon(ICON_FALLBACK_PATH)
         if not app_icon.isNull():
             app.setWindowIcon(app_icon)
+
         window = MainWindow()
         window.show()
+
+        def handle_new_connection():
+            client = server.nextPendingConnection()
+            if client:
+                client.waitForReadyRead(500)
+                if client.bytesAvailable() > 0:
+                    msg = client.readAll().data().decode()
+                    if msg == "raise":
+                        window.activate_window.emit()
+                client.close()
+
+        server.newConnection.connect(handle_new_connection)
+
         sys.exit(app.exec())
