@@ -1,4 +1,4 @@
-# Linux Ryzen Undervolt UI
+# Linux Ryzen Undervolt Tool
 Early development – expect bugs. AI‑assisted code.
 <img width="796" height="627" alt="Bildschirmfoto_20260418_210747" src="https://github.com/user-attachments/assets/a81fbd61-5320-4c51-a436-96e0e42cb273" />
 
